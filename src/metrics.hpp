@@ -26,9 +26,12 @@ struct Metrics {
     std::atomic<std::uint64_t> err_http{0};       // got a response, but status >= 400
     std::atomic<std::uint64_t> err_io{0};         // mid-stream read/write failure
 
-    // Live gauges (go up AND down).
-    std::atomic<std::int64_t> active_connections{0};   // fully established + in request loop
-    std::atomic<std::int64_t> connecting{0};           // mid handshake / connect
+    // Live gauges (go up AND down). Under WinHTTP these count logical workers,
+    // not guaranteed open sockets: WinHTTP pools/reuses connections under the
+    // hood, so `active` means "workers in a request cycle (incl. keep-alive
+    // idle)" and `connecting` means "workers establishing their first send".
+    std::atomic<std::int64_t> active_connections{0};   // established + in request loop
+    std::atomic<std::int64_t> connecting{0};           // pre-first-response / reconnecting
 
     // Snapshot used by the reporter to compute per-interval deltas.
     struct Snapshot {

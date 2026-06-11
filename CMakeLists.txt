@@ -1,22 +1,30 @@
 cmake_minimum_required(VERSION 3.16)
 project(eventhub_loadtest LANGUAGES CXX)
 
-# C++20 for Asio coroutines (co_await). The async connection state machine is
-# dramatically simpler as a coroutine than as a chain of callbacks.
+# Windows-only: the I/O core is native WinHTTP (async) and the SAS crypto is
+# CNG/bcrypt. There is no portable fallback here.
+if(NOT WIN32)
+  message(FATAL_ERROR
+    "eventhub-loadtest is Windows-only (WinHTTP + CNG). Build it on Windows "
+    "with MSVC. The previous Boost.Beast/OpenSSL backend has been removed.")
+endif()
+
+# C++20 for std::atomic niceties and clean structure. (The former Asio
+# coroutine requirement is gone; WinHTTP drives the async state machine.)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-if(NOT CMAKE_BUILD_TYPE)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 
-# Beast + Asio are header-only, and Boost.System has been header-only since
-# 1.69 (the compiled lib is now just an ABI stub some distros omit). So we ask
-# only for Boost headers and link the compiled system lib *if* it exists.
-find_package(Boost 1.74 REQUIRED)
-find_package(OpenSSL REQUIRED)
+# Statically link the MSVC runtime (/MT) so the binary is self-contained: it can
+# run in a minimal Windows container (servercore/nanoserver) with no VC++
+# redistributable installed. Only OS DLLs (winhttp/bcrypt/crypt32) are needed.
+# CMP0091 (>=3.15, NEW by default here) makes this property authoritative.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 find_package(Threads REQUIRED)
 
 add_executable(eh-loadtest
@@ -26,19 +34,19 @@ add_executable(eh-loadtest
   src/client.cpp
 )
 
-target_include_directories(eh-loadtest PRIVATE ${Boost_INCLUDE_DIRS})
+# winhttp: HTTP/TLS client.  bcrypt: HMAC-SHA256 for SAS tokens.
+# crypt32: base64 (CryptBinaryToString).  (The .cpp files also name these via
+# #pragma comment(lib, ...), but list them here for non-MSVC linkers too.)
 target_link_libraries(eh-loadtest PRIVATE
-  Boost::headers
-  OpenSSL::SSL
-  OpenSSL::Crypto
+  winhttp
+  bcrypt
+  crypt32
   Threads::Threads
 )
-# Link the compiled Boost.System stub only on toolchains that still provide it.
-if(TARGET Boost::system)
-  target_link_libraries(eh-loadtest PRIVATE Boost::system)
-endif()
 
-# Asio standalone-coroutine glue + silence the bundled-library deprecation noise.
+# Quiet MSVC's CRT "use the _s variant" warning for std::getenv in config.cpp.
 target_compile_definitions(eh-loadtest PRIVATE
-  BOOST_ASIO_NO_DEPRECATED
+  _CRT_SECURE_NO_WARNINGS
+  WIN32_LEAN_AND_MEAN
+  NOMINMAX
 )

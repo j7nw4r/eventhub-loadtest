@@ -1,0 +1,54 @@
+name: windows-build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # windows-latest ships MSVC + the Windows SDK, which provide WinHTTP,
+      # bcrypt, and crypt32. No third-party dependencies to install.
+      # Don't pin the VS generator version: the hosted image's VS edition gets
+      # bumped over time (e.g. 2022 -> 2026), so let CMake auto-select whichever
+      # Visual Studio is installed. -A x64 still applies to the default VS
+      # generator the runner provides.
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Show help (smoke test the binary loads)
+        run: build\Release\eh-loadtest.exe --help
+
+  # Build the Windows container image and prove the binary runs inside it. The
+  # in-container VS Build Tools install makes this slow (~20+ min); it is the
+  # authoritative "works in a container" check for the deploy path.
+  #
+  # Pinned to windows-2022: it runs the Docker daemon in Windows-container mode.
+  # The newer windows-2025 runner does not start a Windows Docker engine. The
+  # base image (ltsc2022) is matched to the 2022 kernel for process isolation.
+  docker:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # Hosted Windows runners no longer start the Windows Docker engine by
+      # default. Start the service and confirm it's in Windows-container mode.
+      - name: Start Docker (Windows engine)
+        run: |
+          Start-Service docker -ErrorAction SilentlyContinue
+          docker version
+          docker info --format 'OSType={{.OSType}}'
+
+      - name: Build image
+        run: docker build --build-arg WINDOWS_VERSION=ltsc2022 -t eh-loadtest:ci .
+
+      - name: Smoke test (binary runs in the container)
+        run: docker run --rm eh-loadtest:ci --help

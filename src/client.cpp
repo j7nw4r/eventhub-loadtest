@@ -1,38 +1,25 @@
 #include "client.hpp"
 
-#include <boost/asio/awaitable.hpp>
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/detached.hpp>
-#include <boost/asio/executor_work_guard.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/signal_set.hpp>
-#include <boost/asio/ssl.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/asio/strand.hpp>
-#include <boost/asio/this_coro.hpp>
-#include <boost/asio/use_awaitable.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/http.hpp>
-#include <boost/beast/ssl.hpp>
+#include <windows.h>
+#include <winhttp.h>
 
 #include <algorithm>
-#include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <ctime>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "sas_token.hpp"
+#include "win_util.hpp"
+
+#pragma comment(lib, "winhttp.lib")
 
 namespace ehlt {
-
-namespace asio = boost::asio;
-namespace beast = boost::beast;
-namespace http = boost::beast::http;
-namespace ssl = boost::asio::ssl;
-using tcp = boost::asio::ip::tcp;
-using namespace std::chrono_literals;
 
 std::string resolve_auth_value(const Config& cfg) {
     if (cfg.sas_token) return *cfg.sas_token;
@@ -44,218 +31,7 @@ std::string resolve_auth_value(const Config& cfg) {
     return make_sas_token(uri, *cfg.sas_key_name, *cfg.sas_key, now, cfg.sas_ttl_s);
 }
 
-struct Client::Impl {
-    Config cfg;
-    Metrics& metrics;
-    std::string auth_value;
-    std::atomic<bool> stopping{false};
-
-    ssl::context ssl_ctx{ssl::context::tls_client};
-
-    // One io_context per worker thread; connections are pinned to whichever
-    // context spawned them.
-    std::vector<std::unique_ptr<asio::io_context>> contexts;
-    std::vector<std::thread> threads;
-
-    Impl(Config c, Metrics& m) : cfg(std::move(c)), metrics(m) {
-        auth_value = resolve_auth_value(cfg);
-
-        ssl_ctx.set_default_verify_paths();
-        if (cfg.verify_tls) {
-            ssl_ctx.set_verify_mode(ssl::verify_peer);
-        } else {
-            // Load tests routinely hit internal/staging endpoints with certs
-            // that won't chain to a public root; default to not verifying.
-            ssl_ctx.set_verify_mode(ssl::verify_none);
-        }
-    }
-
-    // RAII for the live-connection gauges so they stay correct no matter how a
-    // coroutine unwinds (clean return, exception, or cancellation).
-    struct ConnGuard {
-        Metrics& m;
-        bool established_ = false;
-        explicit ConnGuard(Metrics& mm) : m(mm) { m.connecting.fetch_add(1); }
-        void established() {
-            m.connecting.fetch_sub(1);
-            m.active_connections.fetch_add(1);
-            established_ = true;
-        }
-        ~ConnGuard() {
-            if (established_) m.active_connections.fetch_sub(1);
-            else m.connecting.fetch_sub(1);
-        }
-    };
-
-    // Run a single keep-alive session: connect once, then issue paced requests
-    // over the SAME connection until the quota is met, the peer closes, or an
-    // error is thrown. Returns true if this connection satisfied its request
-    // quota (so the supervisor should stop instead of reconnecting).
-    asio::awaitable<bool> run_session() {
-        auto ex = co_await asio::this_coro::executor;
-        ConnGuard guard(metrics);
-
-        ssl::stream<beast::tcp_stream> stream(ex, ssl_ctx);
-
-        // SNI is mandatory for most TLS front ends (incl. Azure) to route to
-        // the right vhost and present the right cert.
-        if (!SSL_set_tlsext_host_name(stream.native_handle(), cfg.host.c_str())) {
-            metrics.err_connect.fetch_add(1);
-            throw beast::system_error{
-                beast::error_code{static_cast<int>(::ERR_get_error()),
-                                  asio::error::get_ssl_category()}};
-        }
-
-        auto& lowest = beast::get_lowest_layer(stream);
-        const auto op_to = std::chrono::milliseconds(cfg.op_timeout_ms);
-
-        // --- Establish (resolve -> TCP -> TLS) ------------------------------
-        try {
-            tcp::resolver resolver(ex);
-            auto endpoints = co_await resolver.async_resolve(
-                cfg.host, cfg.port, asio::use_awaitable);
-
-            lowest.expires_after(op_to);
-            co_await lowest.async_connect(endpoints, asio::use_awaitable);
-
-            lowest.expires_after(op_to);
-            co_await stream.async_handshake(ssl::stream_base::client,
-                                            asio::use_awaitable);
-        } catch (const beast::system_error& e) {
-            if (e.code() == beast::error::timeout) metrics.err_timeout.fetch_add(1);
-            else metrics.err_connect.fetch_add(1);
-            throw;
-        }
-        guard.established();
-
-        // Prebuild the request once. Token + body are reused verbatim on every
-        // iteration — minting per request is exactly the client-side overhead
-        // we want to avoid (and is not what a sane producer does).
-        http::request<http::string_body> req{http::verb::post, cfg.target, 11};
-        req.set(http::field::host, cfg.host);
-        req.set(cfg.auth_header, auth_value);
-        req.set(http::field::content_type, "application/json");
-        req.set(http::field::user_agent, "eventhub-loadtest/1.0");
-        req.keep_alive(true);
-        req.body() = cfg.payload;
-        req.prepare_payload();
-
-        asio::steady_timer pacer(ex);
-        std::uint64_t sent = 0;
-
-        for (;;) {
-            if (stopping.load(std::memory_order_relaxed)) co_return false;
-
-            // --- One request/response round-trip ----------------------------
-            try {
-                lowest.expires_after(op_to);
-                std::size_t nw = co_await http::async_write(stream, req,
-                                                            asio::use_awaitable);
-                metrics.bytes_sent.fetch_add(nw);
-
-                beast::flat_buffer buffer;
-                http::response<http::string_body> res;
-                lowest.expires_after(op_to);
-                std::size_t nr = co_await http::async_read(stream, buffer, res,
-                                                           asio::use_awaitable);
-                metrics.bytes_recv.fetch_add(nr);
-
-                if (res.result_int() >= 400) {
-                    metrics.err_http.fetch_add(1);
-                    metrics.requests_failed.fetch_add(1);
-                } else {
-                    metrics.requests_ok.fetch_add(1);
-                }
-
-                ++sent;
-                if (cfg.requests_per_connection &&
-                    sent >= cfg.requests_per_connection) {
-                    co_return true;  // quota met — supervisor stops cleanly
-                }
-
-                // Respect an explicit Connection: close from the server; the
-                // socket is no longer reusable, so reconnect (not an error).
-                if (!res.keep_alive()) co_return false;
-            } catch (const beast::system_error& e) {
-                if (e.code() == beast::error::timeout) metrics.err_timeout.fetch_add(1);
-                else metrics.err_io.fetch_add(1);
-                metrics.requests_failed.fetch_add(1);
-                throw;  // supervisor handles backoff + reconnect
-            }
-
-            // --- Pace ----------------------------------------------------------
-            // The gap between requests is what makes this a *sustained* model
-            // rather than a throughput benchmark. The connection sits idle
-            // (keep-alive) between sends, just like a real steady producer.
-            if (cfg.request_interval_ms) {
-                lowest.expires_never();  // don't let the op-timeout fire while idle
-                pacer.expires_after(std::chrono::milliseconds(cfg.request_interval_ms));
-                co_await pacer.async_wait(asio::use_awaitable);
-            }
-        }
-    }
-
-    // Reconnect loop with capped exponential backoff. The cap is what keeps a
-    // failing endpoint from turning into a reconnect storm that would distort
-    // the very CPU measurement we're trying to take.
-    asio::awaitable<void> supervise_connection() {
-        auto ex = co_await asio::this_coro::executor;
-        std::uint64_t backoff = cfg.reconnect_base_ms;
-
-        while (!stopping.load(std::memory_order_relaxed)) {
-            bool quota_done = false;
-            try {
-                quota_done = co_await run_session();
-                backoff = cfg.reconnect_base_ms;  // healthy session resets backoff
-            } catch (const std::exception&) {
-                // Already classified/counted inside run_session.
-            }
-            if (quota_done || stopping.load(std::memory_order_relaxed)) break;
-
-            asio::steady_timer t(ex);
-            t.expires_after(std::chrono::milliseconds(backoff));
-            try {
-                co_await t.async_wait(asio::use_awaitable);
-            } catch (...) { break; }
-            backoff = std::min<std::uint64_t>(backoff * 2, cfg.reconnect_max_ms);
-        }
-        co_return;
-    }
-
-    // Per-thread spawner: brings `count` connections online spread across the
-    // ramp window, so 1000s of TLS handshakes don't land in the same instant.
-    asio::awaitable<void> spawn_ramp(std::size_t count) {
-        auto ex = co_await asio::this_coro::executor;
-        const std::uint64_t step_ms =
-            count > 0 ? (cfg.ramp_s * 1000) / count : 0;
-
-        asio::steady_timer t(ex);
-        for (std::size_t i = 0; i < count; ++i) {
-            if (stopping.load(std::memory_order_relaxed)) break;
-            asio::co_spawn(ex, supervise_connection(), asio::detached);
-            if (step_ms) {
-                t.expires_after(std::chrono::milliseconds(step_ms));
-                try { co_await t.async_wait(asio::use_awaitable); }
-                catch (...) { break; }
-            }
-        }
-        co_return;
-    }
-};
-
-Client::Client(Config cfg, Metrics& metrics)
-    : impl_(std::make_unique<Impl>(std::move(cfg), metrics)) {}
-
-Client::~Client() = default;
-
 namespace {
-
-// Distribute N connections across T threads as evenly as possible.
-std::vector<std::size_t> split(std::size_t total, std::size_t buckets) {
-    std::vector<std::size_t> out(buckets, total / buckets);
-    for (std::size_t i = 0; i < total % buckets; ++i) ++out[i];
-    return out;
-}
 
 void print_report_line(const Metrics& m, double rps, double interval_s) {
     std::cout
@@ -274,81 +50,497 @@ void print_report_line(const Metrics& m, double rps, double interval_s) {
 
 }  // namespace
 
-int Client::run() {
-    auto& I = *impl_;
-    const std::size_t nthreads = I.cfg.resolved_threads();
-    const auto buckets = split(I.cfg.connections, nthreads);
+struct Client::Impl {
+    // One logical connection. Under Beast this was a coroutine frame; under
+    // WinHTTP async it is an explicit state machine advanced by
+    // WinHttpSetStatusCallback completions. A worker churns one request handle
+    // per send and lets WinHTTP's own pool keep the underlying TLS socket warm
+    // for keep-alive reuse.
+    struct Worker {
+        Impl* impl = nullptr;
+        HINTERNET hRequest = nullptr;
+        PTP_TIMER timer = nullptr;       // pacing + backoff (thread-pool timer)
+        // Serializes state transitions across WinHTTP pool threads + the timer
+        // callback. Recursive as a belt-and-suspenders guard: WinHttpCloseHandle
+        // is called while held and HANDLE_CLOSING re-enters; WinHTTP delivers
+        // that callback asynchronously (off this stack), but recursion costs
+        // nothing and removes any same-thread re-entry deadlock.
+        std::recursive_mutex mtx;
+        std::vector<char> rbuf;          // body drain scratch (valid until READ_COMPLETE)
+        std::uint64_t sent = 0;          // requests completed this session (quota)
+        std::uint64_t backoff_ms = 0;    // next reconnect wait
+        bool counted = false;            // contributing to a live gauge
+        bool established = false;        // promoted from "connecting" to "active"
+        bool closing = false;            // a WinHttpCloseHandle is in flight
+        bool started = false;            // launcher has brought this worker online
+        bool dead_finalized = false;     // finalize_dead ran (idempotent guard)
+        enum class Next { Pace, Backoff, Dead } next = Next::Pace;
+    };
 
-    // Build one io_context per thread and spawn that thread's share of
-    // connections through the ramp spawner.
-    I.contexts.reserve(nthreads);
-    for (std::size_t t = 0; t < nthreads; ++t) {
-        I.contexts.push_back(std::make_unique<asio::io_context>(1));
+    Config cfg;
+    Metrics& metrics;
+    std::string auth_value;
+    std::string payload;             // stable buffer for inline POST body
+    std::atomic<bool> stopping{false};
+
+    HINTERNET hSession = nullptr;
+    HINTERNET hConnect = nullptr;
+    std::wstring wtarget;            // request path+query
+    std::wstring wheaders;           // Authorization + Content-Type + User-Agent
+    DWORD security_flags = 0;        // cert-error ignore flags (0 when verifying)
+
+    std::vector<std::unique_ptr<Worker>> workers;
+    std::atomic<std::size_t> live{0};
+    HANDLE stop_event = nullptr;     // signaled on Ctrl handler / duration
+    HANDLE done_event = nullptr;     // signaled when the last worker dies
+    std::thread launcher;
+
+    static Impl* g_self;             // for the console control handler
+
+    Impl(Config c, Metrics& m) : cfg(std::move(c)), metrics(m) {
+        auth_value = resolve_auth_value(cfg);
+        payload = cfg.payload;
+        wtarget = widen(cfg.target);
+
+        // One header block, reused verbatim on every request (Host and
+        // Content-Length are added by WinHTTP). The token is the whole point of
+        // minting once: we never recompute auth on the hot path.
+        std::string headers = cfg.auth_header + ": " + auth_value + "\r\n" +
+                              "Content-Type: application/json\r\n" +
+                              "User-Agent: eventhub-loadtest/1.0";
+        wheaders = widen(headers);
+
+        if (!cfg.verify_tls) {
+            // Load tests routinely hit internal/staging endpoints whose certs
+            // don't chain to a public root; default to ignoring cert errors.
+            security_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                             SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                             SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                             SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        }
     }
 
-    // SIGINT/SIGTERM -> flip the stop flag and stop every context.
-    asio::signal_set signals(*I.contexts[0], SIGINT, SIGTERM);
-    signals.async_wait([&I](const boost::system::error_code&, int sig) {
-        std::cout << "[load] signal " << sig << " received, draining...\n";
-        I.stopping.store(true);
-        for (auto& ctx : I.contexts) ctx->stop();
+    // --- live-connection gauges (the moral equivalent of the old ConnGuard) ---
+    // Called only under worker->mtx. `counted`/`established` make every edge
+    // idempotent so a drop-then-reconnect can't double-count.
+    void gauge_enter(Worker* w) {
+        metrics.connecting.fetch_add(1);
+        w->counted = true;
+        w->established = false;
+    }
+    void gauge_promote(Worker* w) {
+        metrics.connecting.fetch_sub(1);
+        metrics.active_connections.fetch_add(1);
+        w->established = true;
+    }
+    void gauge_exit(Worker* w) {
+        if (!w->counted) return;
+        if (w->established) metrics.active_connections.fetch_sub(1);
+        else metrics.connecting.fetch_sub(1);
+        w->counted = false;
+        w->established = false;
+    }
+
+    void count_error(DWORD err) {
+        // Our own shutdown close surfaces as a cancel; don't score it.
+        if (err == ERROR_WINHTTP_OPERATION_CANCELLED) return;
+        if (err == ERROR_WINHTTP_TIMEOUT) {
+            metrics.err_timeout.fetch_add(1);
+        } else if (err == ERROR_WINHTTP_NAME_NOT_RESOLVED ||
+                   err == ERROR_WINHTTP_CANNOT_CONNECT ||
+                   err == ERROR_WINHTTP_SECURE_FAILURE) {
+            metrics.err_connect.fetch_add(1);
+        } else {
+            metrics.err_io.fetch_add(1);
+        }
+        metrics.requests_failed.fetch_add(1);
+    }
+
+    // Arm the per-worker thread-pool timer `ms` from now. ms==0 fires ASAP.
+    // We always re-enter the next cycle through the timer so the callback stack
+    // stays shallow no matter how tight the pacing.
+    void arm_timer(Worker* w, std::uint64_t ms) {
+        ULONGLONG rel = ms * 10000ULL;  // 100ns units, negative => relative
+        LARGE_INTEGER li;
+        li.QuadPart = -static_cast<LONGLONG>(rel);
+        FILETIME ft;
+        ft.dwLowDateTime = li.LowPart;
+        ft.dwHighDateTime = static_cast<DWORD>(li.HighPart);
+        SetThreadpoolTimer(w->timer, &ft, 0, 0);
+    }
+
+    void finalize_dead(Worker* w) {  // under mtx
+        if (w->dead_finalized) return;
+        w->dead_finalized = true;
+        gauge_exit(w);
+        if (live.fetch_sub(1) == 1) SetEvent(done_event);
+    }
+
+    // After the current request handle is gone (HANDLE_CLOSING) or never
+    // existed, decide what this worker does next.
+    void dispatch_next(Worker* w) {  // under mtx
+        switch (w->next) {
+            case Worker::Next::Pace:
+                if (stopping.load()) { finalize_dead(w); return; }
+                arm_timer(w, cfg.request_interval_ms);
+                return;
+            case Worker::Next::Backoff:
+                if (stopping.load()) { finalize_dead(w); return; }
+                arm_timer(w, w->backoff_ms);
+                w->backoff_ms = (std::min)(w->backoff_ms * 2, cfg.reconnect_max_ms);
+                return;
+            case Worker::Next::Dead:
+                finalize_dead(w);
+                return;
+        }
+    }
+
+    void close_request(Worker* w) {  // under mtx
+        if (w->hRequest && !w->closing) {
+            w->closing = true;
+            WinHttpCloseHandle(w->hRequest);  // async; HANDLE_CLOSING follows
+        } else if (!w->hRequest) {
+            dispatch_next(w);                 // no handle to wait on
+        }
+        // if already closing, the pending HANDLE_CLOSING will dispatch
+    }
+
+    // A request failed (async error or a synchronous WinHTTP false return).
+    void fail_request(Worker* w, DWORD err) {  // under mtx
+        count_error(err);
+        gauge_exit(w);
+        w->next = stopping.load() ? Worker::Next::Dead : Worker::Next::Backoff;
+        close_request(w);
+    }
+
+    // Begin one request cycle: open a request handle, set context/security, and
+    // fire the send. The body is sent inline so there's no WinHttpWriteData step.
+    void start_cycle(Worker* w) {
+        std::lock_guard<std::recursive_mutex> lk(w->mtx);
+        if (stopping.load()) { finalize_dead(w); return; }
+        if (!w->counted) gauge_enter(w);  // cold start of a (re)connect
+
+        HINTERNET hr = WinHttpOpenRequest(
+            hConnect, L"POST", wtarget.c_str(), nullptr, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!hr) {
+            count_error(GetLastError());
+            gauge_exit(w);
+            w->next = stopping.load() ? Worker::Next::Dead : Worker::Next::Backoff;
+            dispatch_next(w);
+            return;
+        }
+        w->hRequest = hr;
+        w->closing = false;
+
+        DWORD_PTR ctx = reinterpret_cast<DWORD_PTR>(w);
+        WinHttpSetOption(hr, WINHTTP_OPTION_CONTEXT_VALUE, &ctx, sizeof(ctx));
+        if (security_flags) {
+            DWORD f = security_flags;
+            WinHttpSetOption(hr, WINHTTP_OPTION_SECURITY_FLAGS, &f, sizeof(f));
+        }
+
+        BOOL ok = WinHttpSendRequest(
+            hr, wheaders.c_str(), static_cast<DWORD>(-1),
+            const_cast<char*>(payload.data()),
+            static_cast<DWORD>(payload.size()),
+            static_cast<DWORD>(payload.size()), ctx);
+        if (!ok) fail_request(w, GetLastError());
+    }
+
+    void on_send_complete(Worker* w) {
+        std::lock_guard<std::recursive_mutex> lk(w->mtx);
+        metrics.bytes_sent.fetch_add(payload.size());
+        if (!w->established) gauge_promote(w);
+        if (!WinHttpReceiveResponse(w->hRequest, nullptr)) {
+            fail_request(w, GetLastError());
+        }
+    }
+
+    void on_headers(Worker* w) {
+        std::lock_guard<std::recursive_mutex> lk(w->mtx);
+        DWORD code = 0, len = sizeof(code);
+        if (!WinHttpQueryHeaders(
+                w->hRequest,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &code, &len,
+                WINHTTP_NO_HEADER_INDEX)) {
+            fail_request(w, GetLastError());
+            return;
+        }
+        if (code >= 400) {
+            metrics.err_http.fetch_add(1);
+            metrics.requests_failed.fetch_add(1);
+        } else {
+            metrics.requests_ok.fetch_add(1);
+        }
+        // Drain the body so the socket returns clean to WinHTTP's keep-alive pool.
+        if (!WinHttpQueryDataAvailable(w->hRequest, nullptr)) {
+            fail_request(w, GetLastError());
+        }
+    }
+
+    void on_data_available(Worker* w, DWORD avail) {
+        std::lock_guard<std::recursive_mutex> lk(w->mtx);
+        if (avail == 0) { body_complete(w); return; }
+        w->rbuf.resize(avail);
+        if (!WinHttpReadData(w->hRequest, w->rbuf.data(), avail, nullptr)) {
+            fail_request(w, GetLastError());
+        }
+    }
+
+    void on_read_complete(Worker* w, DWORD nread) {
+        std::lock_guard<std::recursive_mutex> lk(w->mtx);
+        metrics.bytes_recv.fetch_add(nread);
+        if (nread == 0) { body_complete(w); return; }
+        if (!WinHttpQueryDataAvailable(w->hRequest, nullptr)) {
+            fail_request(w, GetLastError());
+        }
+    }
+
+    void body_complete(Worker* w) {  // under mtx
+        ++w->sent;
+        w->backoff_ms = cfg.reconnect_base_ms;  // healthy cycle resets backoff
+        const bool quota_done =
+            cfg.requests_per_connection && w->sent >= cfg.requests_per_connection;
+        w->next = (quota_done || stopping.load()) ? Worker::Next::Dead
+                                                  : Worker::Next::Pace;
+        close_request(w);  // -> HANDLE_CLOSING -> dispatch_next
+    }
+
+    void on_error(Worker* w, DWORD err) {
+        std::lock_guard<std::recursive_mutex> lk(w->mtx);
+        fail_request(w, err);
+    }
+
+    void on_handle_closing(Worker* w) {
+        std::lock_guard<std::recursive_mutex> lk(w->mtx);
+        w->hRequest = nullptr;
+        w->closing = false;
+        dispatch_next(w);
+    }
+
+    static void CALLBACK status_cb(HINTERNET, DWORD_PTR ctx, DWORD code,
+                                   LPVOID info, DWORD len) {
+        if (ctx == 0) return;  // session/connect handle notifications
+        Worker* w = reinterpret_cast<Worker*>(ctx);
+        Impl* self = w->impl;
+        switch (code) {
+            case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
+                self->on_send_complete(w);
+                break;
+            case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE:
+                self->on_headers(w);
+                break;
+            case WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE:
+                self->on_data_available(w, *reinterpret_cast<DWORD*>(info));
+                break;
+            case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
+                self->on_read_complete(w, len);
+                break;
+            case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR: {
+                auto* r = reinterpret_cast<WINHTTP_ASYNC_RESULT*>(info);
+                self->on_error(w, r->dwError);
+                break;
+            }
+            case WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
+                self->on_handle_closing(w);
+                break;
+            default:
+                break;
+        }
+    }
+
+    static void CALLBACK timer_cb(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_TIMER) {
+        Worker* w = reinterpret_cast<Worker*>(ctx);
+        w->impl->start_cycle(w);
+    }
+
+    static BOOL WINAPI ctrl_handler(DWORD type) {
+        Impl* self = g_self;
+        if (!self) return FALSE;
+        switch (type) {
+            case CTRL_C_EVENT:
+            case CTRL_BREAK_EVENT:
+            case CTRL_CLOSE_EVENT:
+                std::cout << "[load] signal received, draining...\n";
+                self->stopping.store(true);
+                SetEvent(self->stop_event);
+                return TRUE;
+            default:
+                return FALSE;
+        }
+    }
+
+    // Bring connections online spread across the ramp window so thousands of
+    // TLS handshakes don't land in the same instant.
+    void launch() {
+        const std::uint64_t step_ms =
+            cfg.connections > 0 ? (cfg.ramp_s * 1000) / cfg.connections : 0;
+        for (std::size_t i = 0; i < cfg.connections; ++i) {
+            if (stopping.load()) break;
+            workers[i]->started = true;
+            live.fetch_add(1);
+            start_cycle(workers[i].get());
+            if (step_ms) {
+                if (WaitForSingleObject(stop_event, static_cast<DWORD>(step_ms)) ==
+                    WAIT_OBJECT_0) {
+                    break;
+                }
+            }
+        }
+    }
+
+    int run();
+};
+
+Client::Impl* Client::Impl::g_self = nullptr;
+
+Client::Client(Config cfg, Metrics& metrics)
+    : impl_(std::make_unique<Impl>(std::move(cfg), metrics)) {}
+
+Client::~Client() = default;
+
+int Client::Impl::run() {
+    g_self = this;
+    SetConsoleCtrlHandler(&Impl::ctrl_handler, TRUE);
+
+    stop_event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    done_event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+
+    if (cfg.threads != 0) {
+        std::cerr << "[load] note: --threads is ignored under WinHTTP "
+                     "(the WinHTTP thread pool owns concurrency)\n";
+    }
+
+    // --- Session: async, with a connection pool big enough to approximate N ---
+    hSession = WinHttpOpen(L"eventhub-loadtest/1.0",
+                           WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS,
+                           WINHTTP_FLAG_ASYNC);
+    if (!hSession) {
+        std::cerr << "fatal: WinHttpOpen failed (" << GetLastError() << ")\n";
+        return 1;
+    }
+
+    // WinHTTP pools/reuses sockets to *minimize* connections; raise the per-server
+    // cap so the pool can actually hold ~N at once. 'active' is then a count of
+    // logical workers in a request cycle, not a guarantee of N open sockets.
+    DWORD maxc = static_cast<DWORD>((std::max<std::size_t>)(cfg.connections, 2));
+    WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &maxc, sizeof(maxc));
+    WinHttpSetOption(hSession, WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER, &maxc, sizeof(maxc));
+
+    // Coarser than Beast's per-op deadline: WinHTTP exposes only these four
+    // buckets. Idle keep-alive gaps aren't covered (no request handle is open).
+    int t = static_cast<int>(cfg.op_timeout_ms);
+    WinHttpSetTimeouts(hSession, t, t, t, t);
+
+    if (WinHttpSetStatusCallback(hSession, &Impl::status_cb,
+                                 WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS, 0) ==
+        WINHTTP_INVALID_STATUS_CALLBACK) {
+        std::cerr << "fatal: WinHttpSetStatusCallback failed (" << GetLastError() << ")\n";
+        return 1;
+    }
+
+    INTERNET_PORT port = static_cast<INTERNET_PORT>(std::stoul(cfg.port));
+    hConnect = WinHttpConnect(hSession, widen(cfg.host).c_str(), port, 0);
+    if (!hConnect) {
+        std::cerr << "fatal: WinHttpConnect failed (" << GetLastError() << ")\n";
+        return 1;
+    }
+
+    // Pre-create all workers (and their timers) so teardown can always reach
+    // them; only the ones the launcher reaches enter the live count.
+    workers.reserve(cfg.connections);
+    for (std::size_t i = 0; i < cfg.connections; ++i) {
+        auto w = std::make_unique<Worker>();
+        w->impl = this;
+        w->backoff_ms = cfg.reconnect_base_ms;
+        w->timer = CreateThreadpoolTimer(&Impl::timer_cb, w.get(), nullptr);
+        workers.push_back(std::move(w));
+    }
+
+    std::cout << "[load] starting " << cfg.connections << " connections, ramp "
+              << cfg.ramp_s << "s (WinHTTP async)\n";
+
+    // +1 launcher reference keeps `live` from hitting 0 mid-ramp.
+    live.store(1);
+    launcher = std::thread([this] {
+        launch();
+        if (live.fetch_sub(1) == 1) SetEvent(done_event);
     });
 
-    // Optional hard duration limit.
-    asio::steady_timer duration_timer(*I.contexts[0]);
-    if (I.cfg.duration_s) {
-        duration_timer.expires_after(std::chrono::seconds(I.cfg.duration_s));
-        duration_timer.async_wait([&I](const boost::system::error_code& ec) {
-            if (ec) return;  // cancelled
-            std::cout << "[load] duration reached, draining...\n";
-            I.stopping.store(true);
-            for (auto& ctx : I.contexts) ctx->stop();
-        });
-    }
-
-    for (std::size_t t = 0; t < nthreads; ++t) {
-        asio::co_spawn(*I.contexts[t], I.spawn_ramp(buckets[t]), asio::detached);
-    }
-
-    std::cout << "[load] starting " << nthreads << " worker threads, "
-              << I.cfg.connections << " connections, ramp "
-              << I.cfg.ramp_s << "s\n";
-
-    // Launch workers. Each thread runs its own context until stopped.
-    for (std::size_t t = 0; t < nthreads; ++t) {
-        I.threads.emplace_back([ctx = I.contexts[t].get()] {
-            // work_guard keeps run() alive even when momentarily idle (e.g.
-            // every connection is in its pacing wait).
-            auto guard = asio::make_work_guard(*ctx);
-            ctx->run();
-        });
-    }
-
-    // Reporter thread: pure reader of the atomics, computes per-window rps.
-    std::thread reporter([&I, nthreads] {
-        const double iv = static_cast<double>(I.cfg.report_interval_s);
-        std::uint64_t last = I.metrics.requests_ok.load() + I.metrics.requests_failed.load();
-        while (!I.stopping.load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(I.cfg.report_interval_s));
-            if (I.stopping.load()) break;
-            std::uint64_t now = I.metrics.requests_ok.load() + I.metrics.requests_failed.load();
+    // Reporter: pure reader of the atomics. Hold off the first window until the
+    // ramp (+ warmup) is past so early turbulence doesn't skew the rps figure.
+    std::thread reporter([this] {
+        const double iv = static_cast<double>(cfg.report_interval_s);
+        if (cfg.ramp_s || cfg.warmup_s) {
+            DWORD hold = static_cast<DWORD>((cfg.ramp_s + cfg.warmup_s) * 1000);
+            if (WaitForSingleObject(stop_event, hold) == WAIT_OBJECT_0) return;
+        }
+        std::uint64_t last =
+            metrics.requests_ok.load() + metrics.requests_failed.load();
+        while (!stopping.load()) {
+            if (WaitForSingleObject(stop_event,
+                    static_cast<DWORD>(cfg.report_interval_s * 1000)) == WAIT_OBJECT_0) {
+                break;
+            }
+            std::uint64_t now =
+                metrics.requests_ok.load() + metrics.requests_failed.load();
             double rps = iv > 0 ? (now - last) / iv : 0.0;
             last = now;
-            print_report_line(I.metrics, rps, iv);
+            print_report_line(metrics, rps, iv);
         }
     });
 
-    for (auto& th : I.threads) th.join();
+    // Block until Ctrl-C/duration (stop_event) or everyone finished (done_event).
+    HANDLE waits[2] = {stop_event, done_event};
+    DWORD waitms = cfg.duration_s ? static_cast<DWORD>(cfg.duration_s * 1000)
+                                  : INFINITE;
+    DWORD wr = WaitForMultipleObjects(2, waits, FALSE, waitms);
+    if (wr == WAIT_TIMEOUT) {
+        std::cout << "[load] duration reached, draining...\n";
+    }
 
-    // Reporter may be mid-sleep; flip + nudge it.
-    I.stopping.store(true);
+    // --- Drain ---------------------------------------------------------------
+    stopping.store(true);
+    SetEvent(stop_event);
+    // Stop future pacing/backoff fires, then cancel in-flight requests or
+    // finalize idle workers. The HANDLE_CLOSING handshake (async) is what frees
+    // each cycle; per-worker mtx serializes against any racing timer callback.
+    for (auto& w : workers) SetThreadpoolTimer(w->timer, nullptr, 0, 0);
+    for (auto& w : workers) {
+        std::lock_guard<std::recursive_mutex> lk(w->mtx);
+        if (!w->started || w->dead_finalized) continue;
+        if (w->hRequest && !w->closing) {
+            w->closing = true;
+            WinHttpCloseHandle(w->hRequest);
+        } else if (!w->hRequest) {
+            finalize_dead(w.get());
+        }
+    }
+    WaitForSingleObject(done_event, 30000);  // best-effort grace
+
+    // No more callbacks, then tear down handles and timers.
+    WinHttpSetStatusCallback(hSession, nullptr, 0, 0);
+    if (hConnect) WinHttpCloseHandle(hConnect);
+    if (hSession) WinHttpCloseHandle(hSession);
+    for (auto& w : workers) {
+        SetThreadpoolTimer(w->timer, nullptr, 0, 0);
+        WaitForThreadpoolTimerCallbacks(w->timer, TRUE);
+        CloseThreadpoolTimer(w->timer);
+    }
+
+    if (launcher.joinable()) launcher.join();
     if (reporter.joinable()) reporter.join();
 
-    std::cout << "[load] final: ok=" << I.metrics.requests_ok.load()
-              << " failed=" << I.metrics.requests_failed.load()
-              << " bytes_sent=" << I.metrics.bytes_sent.load()
-              << " bytes_recv=" << I.metrics.bytes_recv.load() << "\n";
+    std::cout << "[load] final: ok=" << metrics.requests_ok.load()
+              << " failed=" << metrics.requests_failed.load()
+              << " bytes_sent=" << metrics.bytes_sent.load()
+              << " bytes_recv=" << metrics.bytes_recv.load() << "\n";
     return 0;
 }
+
+int Client::run() { return impl_->run(); }
 
 }  // namespace ehlt

@@ -1,10 +1,10 @@
 # Horizontal scale: replicas x --connections = total sustained connections.
 #   20 replicas x 2000 connections = ~40,000 sustained connections.
 #
-# Keep per-pod connections modest (each TLS connection costs ~tens of KB of
-# heap plus an fd) and add replicas to reach the target. Many small pods give a
-# more realistic, distributed client footprint than one giant process and avoid
-# a single pod hitting the kernel's per-process fd ceiling.
+# Many small pods give a more realistic, distributed client footprint than one
+# giant process. This is a WINDOWS container, so it must land on a Windows node
+# pool (nodeSelector below); the image base must match the node's Windows build
+# (see Dockerfile WINDOWS_VERSION).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -18,6 +18,9 @@ spec:
     metadata:
       labels: { app: eh-loadtest }
     spec:
+      # Schedule onto Windows nodes; this is a Windows container image.
+      nodeSelector:
+        kubernetes.io/os: windows
       containers:
         - name: eh-loadtest
           image: youracr.azurecr.io/eh-loadtest:1.0
@@ -37,9 +40,6 @@ spec:
           resources:
             requests: { cpu: "250m", memory: "256Mi" }
             limits:   { cpu: "1",    memory: "512Mi" }
-      # Raise the file-descriptor ceiling so a pod can hold thousands of sockets.
-      # (Requires a runtime that honors pod-level ulimits, or a node-level
-      # default. On AKS the default hard limit is usually high enough for 2000.)
 ---
 # Create the Secret once (do NOT commit real values):
 #   kubectl create secret generic eh-sas \
