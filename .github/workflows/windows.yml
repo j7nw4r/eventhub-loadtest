@@ -1,0 +1,24 @@
+name: windows-build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # windows-latest ships MSVC + the Windows SDK, which provide WinHTTP,
+      # bcrypt, and crypt32. No third-party dependencies to install.
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Show help (smoke test the binary loads)
+        run: build\Release\eh-loadtest.exe --help

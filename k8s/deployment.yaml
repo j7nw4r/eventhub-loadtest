@@ -1,3 +1,8 @@
+# AIDEV-TODO: STALE. Assumes a Linux container image; the tool is now
+# Windows/WinHTTP-only. Needs a Windows-container image plus a Windows node pool
+# (nodeSelector: kubernetes.io/os: windows) before this works. The fd-limit notes
+# below are POSIX-specific and no longer apply. Kept for reference only.
+#
 # Horizontal scale: replicas x --connections = total sustained connections.
 #   20 replicas x 2000 connections = ~40,000 sustained connections.
 #

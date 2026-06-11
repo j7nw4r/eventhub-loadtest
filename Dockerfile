@@ -1,3 +1,9 @@
+# AIDEV-TODO: STALE. This Linux/Ubuntu image builds the OLD Boost.Beast/OpenSSL
+# backend, which no longer exists. The tool is now Windows/WinHTTP-only and will
+# NOT build here. Reworking this for Windows containers (e.g. a servercore build
+# stage with MSVC + a nanoserver runtime) is deferred; until then, build with
+# MSVC and run eh-loadtest.exe directly (see README). Kept for reference only.
+#
 # Multi-stage build: compile against Boost+OpenSSL, ship a slim runtime image.
 FROM ubuntu:24.04 AS build
 

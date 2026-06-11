@@ -1,10 +1,13 @@
-// client.hpp — the load generator engine.
+// client.hpp - the load generator engine (Windows / WinHTTP).
 //
-// Threading model: one io_context per worker thread, and every connection is
-// pinned to the thread that created it (it never migrates). That means the hot
-// path — write request, read response, wait — touches only thread-local state
-// plus a handful of atomics, so adding cores scales close to linearly instead
-// of fighting over a single shared run-queue.
+// Concurrency model: WinHTTP runs in async mode and owns its own IOCP thread
+// pool, so this code does not manage worker threads or event loops. Each logical
+// connection is a Worker state machine advanced by WinHttpSetStatusCallback
+// completions (send -> receive -> drain -> pace), with per-worker thread-pool
+// timers for pacing and backoff. The hot path stays lock-light: only a short
+// per-worker mutex guards state transitions, and the metrics are plain atomics.
+//
+// Windows-only: this replaces the former Boost.Asio/Beast/OpenSSL stack.
 #pragma once
 
 #include <atomic>
