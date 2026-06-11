@@ -1,13 +1,28 @@
 # eventhub-loadtest
 
-A systems-level C++20 HTTP load generator for evaluating **gateway CPU under
-sustained, keep-alive load** — shaped for Azure Event Hubs' HTTP send endpoint,
-but it works against any HTTPS endpoint that accepts a small POST body.
+A systems-level **C++20 HTTPS load generator** for measuring how an API gateway
+behaves under thousands of **sustained, long-lived keep-alive connections**. It
+is shaped for the Azure Event Hubs HTTP send endpoint (SAS auth, small JSON
+events), but works against any HTTPS endpoint that accepts a small POST body.
 
-The design goal is *steady state*, not peak throughput: hold N long-lived TLS
-connections open, send a small paced request on each, and measure how the
-server behaves — especially **SAS auth overhead**, since the token is computed
-once and reused on every request (exactly what a well-behaved producer does).
+It is built for one specific question: *how much CPU does the gateway burn at
+steady state, and how much of that is authentication overhead?* To answer it
+honestly the client has to behave like a real fleet of well-written producers,
+not a benchmark hammer:
+
+- **Steady state, not peak throughput.** Hold N TLS connections open and send a
+  small paced request on each; the connection sits idle (keep-alive) between
+  sends, exactly like a real producer trickling telemetry.
+- **Auth done right.** The SAS token is computed *once* and reused verbatim on
+  every request, so what you measure is the *gateway's* validation cost, not the
+  client's signing cost.
+- **No connection storms.** Connections ramp up gradually and reconnect with
+  capped backoff, so transient failures don't turn into a thundering herd that
+  would corrupt the very CPU measurement you're taking.
+
+It scales horizontally: each process holds a configurable slice of connections,
+and you reach big numbers (e.g. ~40,000) by running many small instances across
+nodes/pods rather than one oversized process.
 
 > **Authorized use only.** This generates heavy, sustained traffic. Run it only
 > against endpoints you own or are explicitly authorized to test. It is a
@@ -29,8 +44,42 @@ once and reused on every request (exactly what a well-behaved producer does).
 | Horizontal scale | Small per-pod connection count × many replicas (see `k8s/`) |
 
 Boost.Beast (not cpprestsdk, which Microsoft has archived) gives header-only
-HTTP+TLS on top of Asio; C++20 coroutines turn the connect→handshake→loop state
-machine into linear, readable code while staying fully async.
+HTTP+TLS on top of Asio; C++20 coroutines turn the connect -> handshake -> loop
+state machine into linear, readable code while staying fully async.
+
+## How it works
+
+```
+                 main thread
+                     |
+   spawns one io_context per worker thread (default: CPU count)
+                     |
+   +-----------------+------------------+   ... pinned, no work-stealing
+   |                 |                  |
+ thread 0          thread 1           thread N
+ io_context        io_context         io_context
+   |                 |                  |
+ ramp spawner      ramp spawner       ramp spawner   <- staggers connection
+   |  \  \           |  \               |               setup over --ramp-s
+  conn conn ...     conn conn ...      conn ...        (anti connection-storm)
+   |
+   +-- supervise_connection()  (capped-backoff reconnect loop)
+         |
+         +-- run_session()  [coroutine]
+               resolve -> TCP connect -> TLS handshake   (once)
+               loop:
+                 write small JSON POST  (reused token + body)
+                 read response, classify status
+                 wait --interval-ms     (idle keep-alive)   <- the steady-state lever
+               until quota / Connection: close / error
+
+   reporter thread  -- reads lock-free atomics, prints rps + error taxonomy
+```
+
+Each connection lives entirely on the thread that created it, so the hot path
+(write/read/wait) touches only thread-local state plus a few atomic counters.
+That is what lets a single process hold thousands of connections without lock
+contention, and what makes adding cores scale close to linearly.
 
 ## Build
 
@@ -131,3 +180,7 @@ CMakeLists.txt    Release build
 Dockerfile        multi-stage container image
 k8s/deployment.yaml  horizontal scale-out to ~40K connections
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
