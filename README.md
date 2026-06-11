@@ -112,19 +112,60 @@ per-process handle pressure): `replicas × --connections = total`, e.g.
 Windows container onto a Windows node pool (`nodeSelector: kubernetes.io/os:
 windows`), connection string from a k8s Secret.
 
-## Key knobs
+## Configuration
+
+Every knob is a CLI flag; the ones carrying secrets or per-environment values
+also read an env var (the flag wins when both are set). Precedence, lowest to
+highest: connection string (`--connection-string` / `EH_CONNECTION_STRING`) →
+individual env vars → CLI flags. `eh-loadtest --help` prints the same list
+inline.
+
+### Target
 
 | Flag (env) | Default | Effect |
 |---|---|---|
-| `--connections` | 1000 | Sustained connections this process holds (also WinHTTP's per-server pool cap) |
-| `--threads` | n/a | Accepted but ignored; WinHTTP owns concurrency |
-| `--interval-ms` | 1000 | Gap between requests per connection (steady-state lever) |
-| `--ramp-s` | 30 | Spread connection setup over this window |
-| `--duration-s` | 0 | Run time; 0 = until Ctrl-C |
-| `--requests-per-conn` | 0 | Stop a connection after N requests; 0 = unlimited |
-| `--op-timeout-ms` | 15000 | Resolve/connect/send/receive deadline |
-| `--reconnect-base/max-ms` | 500 / 10000 | Capped backoff after a drop |
-| `--verify-tls` | off | Validate the server certificate (default: ignore cert errors) |
+| `--host <fqdn>` (`EH_HOST`) | _required_ | Target host, e.g. `myns.servicebus.windows.net` |
+| `--port <p>` | 443 | TLS port |
+| `--target <path>` | EH messages endpoint | Request path + query (set from `EntityPath` when a connection string is used) |
+| `--verify-tls` | off | Validate the server certificate (default: ignore cert errors, which suits internal/staging endpoints) |
+
+### Auth (token is minted/parsed once, then reused for every request)
+
+| Flag (env) | Default | Effect |
+|---|---|---|
+| `--connection-string <cs>` (`EH_CONNECTION_STRING`) | _none_ | EH connection string; sets host, key, and (via `EntityPath`) the target + signing URI |
+| `--sas-token <value>` (`EH_SAS_TOKEN`) | _none_ | Full `SharedAccessSignature sr=...` header, reused verbatim |
+| `--sas-key-name <name>` (`EH_SAS_KEY_NAME`) | _none_ | SAS policy name; with `--sas-key`, mints one token at startup |
+| `--sas-key <secret>` (`EH_SAS_KEY`) | _none_ | SAS key (base64) used for minting |
+| `--sas-uri <uri>` | `https://<host>/` | Resource URI to sign (entity-scoped when derived from a connection string) |
+| `--sas-ttl-s <n>` | 3600 | Minted-token lifetime in seconds |
+| `--auth-header <name>` | `Authorization` | Header the token is injected into |
+
+Provide auth one of three ways: a connection string, a ready-made `--sas-token`,
+or `--sas-key-name` + `--sas-key` to mint one. Deliver secrets via env (a k8s
+Secret, or `op run`) so they never land in a process list or manifest.
+
+### Load model
+
+| Flag (env) | Default | Effect |
+|---|---|---|
+| `--connections <n>` | 1000 | Sustained connections this process holds (also WinHTTP's per-server pool cap) |
+| `--threads <n>` | n/a | Accepted but ignored; WinHTTP owns concurrency via its IOCP pool |
+| `--interval-ms <n>` | 1000 | Gap between requests per connection (steady-state lever) |
+| `--requests-per-conn <n>` | 0 | Stop a connection after N requests; 0 = unlimited |
+| `--ramp-s <n>` | 30 | Spread connection setup over this window |
+| `--warmup-s <n>` | 0 | Extra idle hold after ramp before the first reported window (so early turbulence doesn't skew rps) |
+| `--duration-s <n>` | 0 | Total run time; 0 = until Ctrl-C |
+| `--payload <json>` | small telemetry doc | Request body sent on every POST |
+
+### Resilience / observability
+
+| Flag (env) | Default | Effect |
+|---|---|---|
+| `--op-timeout-ms <n>` | 15000 | Resolve/connect/send/receive deadline |
+| `--reconnect-base-ms <n>` | 500 | Backoff floor after a dropped connection |
+| `--reconnect-max-ms <n>` | 10000 | Backoff ceiling (keeps reconnects non-aggressive) |
+| `--report-interval-s <n>` | 5 | How often the metrics line prints |
 
 Offered rate per process ≈ `connections / (interval_ms / 1000)` rps once ramped
 (2000 conns at 1000ms ≈ 2000 rps).
