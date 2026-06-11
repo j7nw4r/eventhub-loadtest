@@ -24,12 +24,12 @@ small instances, not one oversized process.
 
 ## Build
 
-Needs Windows with **MSVC + the Windows SDK** (Visual Studio 2022 or the Build
-Tools) and **CMake 3.16+**. No third-party dependencies: `winhttp`, `bcrypt`, and
-`crypt32` ship with the SDK.
+Needs Windows with **MSVC + the Windows SDK** (Visual Studio 2022 or newer, or
+the Build Tools) and **CMake 3.16+**. No third-party dependencies: `winhttp`,
+`bcrypt`, and `crypt32` ship with the SDK; the MSVC runtime is linked statically.
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -A x64          # auto-detects the installed Visual Studio
 cmake --build build --config Release
 # binary: build\Release\eh-loadtest.exe   (--help lists every knob)
 ```
