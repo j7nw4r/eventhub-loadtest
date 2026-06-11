@@ -26,3 +26,18 @@ jobs:
 
       - name: Show help (smoke test the binary loads)
         run: build\Release\eh-loadtest.exe --help
+
+  # Build the Windows container image and prove the binary runs inside it. The
+  # in-container VS Build Tools install makes this slow (~20+ min); it is the
+  # authoritative "works in a container" check for the deploy path. The base
+  # image is matched to the hosted runner's Windows build for process isolation.
+  docker:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --build-arg WINDOWS_VERSION=ltsc2025 -t eh-loadtest:ci .
+
+      - name: Smoke test (binary runs in the container)
+        run: docker run --rm eh-loadtest:ci --help

@@ -92,17 +92,25 @@ keep-alive idle between paced sends), not a guaranteed count of open sockets:
 WinHTTP pools and reuses connections beneath the API. `--connections` raises
 WinHTTP's per-server connection cap so the pool can actually hold ~N at once.
 
+## Container
+
+A multi-stage **Windows** [`Dockerfile`](Dockerfile) builds the binary (servercore
++ VS Build Tools) and ships a self-contained exe (static CRT, only OS DLLs
+needed). Match the base image to your host's Windows build for process isolation.
+
+```powershell
+docker build --build-arg WINDOWS_VERSION=ltsc2022 -t eh-loadtest:1.0 .
+docker run --rm -e EH_CONNECTION_STRING="Endpoint=sb://...;EntityPath=myeventhub" `
+  eh-loadtest:1.0 --connections 2000 --interval-ms 1000 --ramp-s 60
+```
+
 ## Scale to ~40K connections
 
 Run many small instances rather than one large process (single-NIC limits,
-per-process handle pressure): `instances × --connections = total`, e.g.
-`20 × 2000 = 40,000`. Launch several `eh-loadtest.exe` processes, each with its
-own `--connections`, pointed at the same endpoint.
-
-<!-- AIDEV-TODO: Dockerfile and k8s/deployment.yaml still assume Linux and won't
-     build/run this Windows binary. They need a Windows-container rework
-     (servercore build -> nanoserver runtime, nodeSelector kubernetes.io/os:
-     windows) before the container/k8s path works again. -->
+per-process handle pressure): `replicas × --connections = total`, e.g.
+`20 × 2000 = 40,000`. [`k8s/deployment.yaml`](k8s/deployment.yaml) deploys the
+Windows container onto a Windows node pool (`nodeSelector: kubernetes.io/os:
+windows`), connection string from a k8s Secret.
 
 ## Key knobs
 
@@ -126,8 +134,8 @@ Offered rate per process ≈ `connections / (interval_ms / 1000)` rps once rampe
 `src/` - `main` · `config` (knobs + CLI/env) · `sas_token` (HMAC-SHA256 via CNG,
 minted once) · `metrics` (lock-free counters) · `client` (WinHTTP async engine:
 ramp, per-worker state machine, keep-alive, backoff, drain) · `win_util` (UTF-8
-to UTF-16). Plus `CMakeLists.txt` and `.github/workflows/windows.yml` (MSVC build
-CI). `Dockerfile` and `k8s/` are stale (Linux) pending a Windows-container rework.
+to UTF-16). Plus `CMakeLists.txt`, a Windows `Dockerfile`, `k8s/` (Windows-node
+Deployment), and `.github/workflows/windows.yml` (MSVC build + container CI).
 
 ## License
 
