@@ -30,12 +30,22 @@ cmake --build build -j
 
 ## Run
 
-```bash
-# token supplied directly (reused for every request)
-export EH_SAS_TOKEN='SharedAccessSignature sr=...&sig=...&se=...&skn=...'
-# ...or let the tool mint it once from a key:
-# export EH_SAS_KEY_NAME=RootManageSharedAccessKey EH_SAS_KEY=<base64-key>
+Simplest: hand it an Event Hubs connection string. It derives the host, the
+request target, and the (entity-scoped) signing URI, and mints the SAS token
+once:
 
+```bash
+export EH_CONNECTION_STRING='Endpoint=sb://myns.servicebus.windows.net/;SharedAccessKeyName=SendPolicy;SharedAccessKey=<base64-key>;EntityPath=myeventhub'
+./build/eh-loadtest --connections 2000 --interval-ms 1000 --ramp-s 60
+```
+
+Or configure the pieces explicitly (any of these override the connection
+string):
+
+```bash
+# A) a key (token minted once)        B) a ready-made token (reused verbatim)
+export EH_SAS_KEY_NAME=RootManageSharedAccessKey   # export EH_SAS_TOKEN='SharedAccessSignature sr=...'
+export EH_SAS_KEY=<base64-key>
 ./build/eh-loadtest \
   --host myns.servicebus.windows.net \
   --target '/myeventhub/messages?api-version=2014-01' \
@@ -52,8 +62,9 @@ Output:
 
 Run many small instances rather than one large process (fd ceilings, single-NIC
 limits): `replicas × --connections = total`, e.g. `20 × 2000 = 40,000`. See
-[`k8s/deployment.yaml`](k8s/deployment.yaml) (SAS key from a k8s Secret). For
-many connections in one process, raise the fd limit first (`ulimit -n 65535`).
+[`k8s/deployment.yaml`](k8s/deployment.yaml) (connection string from a k8s
+Secret). For many connections in one process, raise the fd limit first
+(`ulimit -n 65535`).
 
 ## Key knobs
 

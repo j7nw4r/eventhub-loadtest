@@ -22,21 +22,18 @@ spec:
         - name: eh-loadtest
           image: youracr.azurecr.io/eh-loadtest:1.0
           args:
-            - "--host=$(EH_HOST)"
-            - "--target=/myeventhub/messages?api-version=2014-01"
+            # host, target, and signing URI are all derived from the
+            # connection string in EH_CONNECTION_STRING below.
             - "--connections=2000"
             - "--interval-ms=1000"
             - "--ramp-s=60"
             - "--warmup-s=30"
             - "--report-interval-s=10"
           env:
-            - name: EH_HOST
-              value: "myns.servicebus.windows.net"
-            # SAS material from a k8s Secret — never bake tokens into the image.
-            - name: EH_SAS_KEY_NAME
-              valueFrom: { secretKeyRef: { name: eh-sas, key: keyName } }
-            - name: EH_SAS_KEY
-              valueFrom: { secretKeyRef: { name: eh-sas, key: key } }
+            # Whole connection string from a k8s Secret - never bake it into
+            # the image. Include EntityPath=<hub> so the target is set for you.
+            - name: EH_CONNECTION_STRING
+              valueFrom: { secretKeyRef: { name: eh-sas, key: connectionString } }
           resources:
             requests: { cpu: "250m", memory: "256Mi" }
             limits:   { cpu: "1",    memory: "512Mi" }
@@ -46,5 +43,4 @@ spec:
 ---
 # Create the Secret once (do NOT commit real values):
 #   kubectl create secret generic eh-sas \
-#     --from-literal=keyName='RootManageSharedAccessKey' \
-#     --from-literal=key='<base64-sas-key>'
+#     --from-literal=connectionString='Endpoint=sb://myns.servicebus.windows.net/;SharedAccessKeyName=SendPolicy;SharedAccessKey=<base64-key>;EntityPath=myeventhub'

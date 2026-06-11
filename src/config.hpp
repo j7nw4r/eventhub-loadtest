@@ -61,6 +61,16 @@ struct Config {
     }
 };
 
+// Parse an Azure Event Hubs / Service Bus connection string of the form
+//   Endpoint=sb://<ns>.servicebus.windows.net/;SharedAccessKeyName=<name>;
+//   SharedAccessKey=<key>;EntityPath=<hub>
+// and populate the matching Config fields (host, key name/key, and - when
+// EntityPath is present - the request target and the entity-scoped signing
+// URI). A pre-baked SharedAccessSignature=<token> field is also honored.
+// Returns false with `err` set on a malformed string. Fields the string does
+// not mention are left untouched, so callers can still override afterwards.
+bool parse_connection_string(const std::string& cs, Config& out, std::string& err);
+
 // Parse argv (and a few env vars) into a Config. Returns false and prints to
 // stderr on bad input; sets `show_help` when the user asked for --help.
 bool parse_config(int argc, char** argv, Config& out, bool& show_help, std::string& err);

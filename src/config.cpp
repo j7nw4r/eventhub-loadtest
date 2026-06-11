@@ -1,5 +1,6 @@
 #include "config.hpp"
 
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -53,12 +54,105 @@ const char* getenv_opt(const char* k) {
     return (v && *v) ? v : nullptr;
 }
 
+std::string trim(std::string_view s) {
+    auto b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string_view::npos) return {};
+    auto e = s.find_last_not_of(" \t\r\n");
+    return std::string(s.substr(b, e - b + 1));
+}
+
+bool iequals(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) return false;
+    }
+    return true;
+}
+
 }  // namespace
+
+bool parse_connection_string(const std::string& cs, Config& c, std::string& err) {
+    std::string endpoint, key_name, key, entity, token;
+
+    // Split on ';' into key=value pairs. Each value is "everything after the
+    // FIRST '='" so base64 keys (which end in '=' padding) survive intact.
+    std::size_t pos = 0;
+    while (pos < cs.size()) {
+        std::size_t semi = cs.find(';', pos);
+        std::string_view part =
+            std::string_view(cs).substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
+        pos = (semi == std::string::npos) ? cs.size() : semi + 1;
+
+        std::string field = trim(part);
+        if (field.empty()) continue;
+        auto eq = field.find('=');
+        if (eq == std::string::npos) {
+            err = "malformed connection string near '" + field + "' (expected key=value)";
+            return false;
+        }
+        std::string k = trim(std::string_view(field).substr(0, eq));
+        std::string v = trim(std::string_view(field).substr(eq + 1));
+
+        if (iequals(k, "Endpoint")) endpoint = v;
+        else if (iequals(k, "SharedAccessKeyName")) key_name = v;
+        else if (iequals(k, "SharedAccessKey")) key = v;
+        else if (iequals(k, "EntityPath")) entity = v;
+        else if (iequals(k, "SharedAccessSignature")) token = v;
+        // Unknown fields (e.g. UseDevelopmentEmulator) are ignored on purpose.
+    }
+
+    // Host from Endpoint: strip scheme (sb://, https://, http://) and any
+    // trailing slash, leaving "<ns>.servicebus.windows.net".
+    if (!endpoint.empty()) {
+        std::string_view e = endpoint;
+        if (auto s = e.find("://"); s != std::string_view::npos) e = e.substr(s + 3);
+        while (!e.empty() && e.back() == '/') e.remove_suffix(1);
+        c.host = std::string(e);
+    }
+    if (!key_name.empty()) c.sas_key_name = key_name;
+    if (!key.empty()) c.sas_key = key;
+    if (!token.empty()) c.sas_token = token;  // pre-baked token; reused verbatim
+
+    if (!entity.empty()) {
+        // Request path for the Event Hubs HTTP send endpoint...
+        c.target = "/" + entity + "/messages?api-version=2014-01";
+        // ...and the entity-scoped signing URI, so an entity-level SAS policy
+        // (not just a namespace-wide one) verifies correctly.
+        c.sas_uri = "https://" + c.host + "/" + entity;
+    }
+
+    if (c.host.empty()) {
+        err = "connection string is missing Endpoint=sb://<host>/";
+        return false;
+    }
+    if (!c.sas_token && !(c.sas_key && c.sas_key_name)) {
+        err = "connection string is missing SharedAccessKeyName/SharedAccessKey "
+              "(or a SharedAccessSignature token)";
+        return false;
+    }
+    return true;
+}
 
 bool parse_config(int argc, char** argv, Config& c, bool& show_help, std::string& err) {
     show_help = false;
 
-    // Environment defaults first; CLI flags below can override them. Secrets
+    // Layer 0 (lowest precedence): a connection string sets host + auth +
+    // entity-derived target/URI in one shot. It can come from the environment
+    // or from --connection-string (the flag wins over the env var). Individual
+    // env vars and CLI flags below then override anything it set.
+    {
+        std::string cs;
+        if (const char* v = getenv_opt("EH_CONNECTION_STRING")) cs = v;
+        for (int i = 1; i < argc; ++i) {
+            std::string_view a = argv[i];
+            if (a == "--connection-string" && i + 1 < argc) cs = argv[i + 1];
+            else if (a.rfind("--connection-string=", 0) == 0) cs = std::string(a.substr(20));
+        }
+        if (!cs.empty() && !parse_connection_string(cs, c, err)) return false;
+    }
+
+    // Environment defaults next; CLI flags below can override them. Secrets
     // are best delivered via env (k8s Secret -> env var).
     if (const char* v = getenv_opt("EH_SAS_TOKEN")) c.sas_token = v;
     if (const char* v = getenv_opt("EH_SAS_KEY")) c.sas_key = v;
@@ -75,6 +169,7 @@ bool parse_config(int argc, char** argv, Config& c, bool& show_help, std::string
         };
 
         if (a == "-h" || a == "--help") { show_help = true; return true; }
+        else if (a.rfind("--connection-string", 0) == 0) { if (!need("--connection-string")) return false; /* applied in layer 0 */ }
         else if (a.rfind("--host", 0) == 0)            { if (!need("--host")) return false; c.host = val; }
         else if (a.rfind("--port", 0) == 0)            { if (!need("--port")) return false; c.port = val; }
         else if (a.rfind("--target", 0) == 0)          { if (!need("--target")) return false; c.target = val; }
@@ -131,6 +226,7 @@ std::string describe(const Config& c) {
        << "  duration_s        " << (c.duration_s ? std::to_string(c.duration_s) : "until SIGINT") << "\n"
        << "  payload_bytes     " << c.payload.size() << "\n"
        << "  auth              " << (c.sas_token ? "supplied token (reused)" : "minted once from key (reused)") << "\n"
+       << "  signing_uri       " << (c.sas_token ? "(n/a, token supplied)" : c.sas_uri.value_or("https://" + c.host + "/")) << "\n"
        << "  op_timeout_ms     " << c.op_timeout_ms << "\n"
        << "  reconnect_backoff " << c.reconnect_base_ms << "ms .. " << c.reconnect_max_ms << "ms\n";
     return os.str();
@@ -149,6 +245,8 @@ void print_usage(const char* argv0) {
 "  --verify-tls              verify the server certificate (default: off)\n"
 "\n"
 "Auth (token is generated/parsed ONCE and reused for every request):\n"
+"  --connection-string <cs>  Event Hubs connection string; sets host, key, and\n"
+"                            (via EntityPath) the target + signing URI         (env EH_CONNECTION_STRING)\n"
 "  --sas-token <value>       full 'SharedAccessSignature sr=...' header value  (env EH_SAS_TOKEN)\n"
 "  --sas-key-name <name>     SAS policy name, with --sas-key, to mint a token  (env EH_SAS_KEY_NAME)\n"
 "  --sas-key <secret>        SAS key (base64)                                  (env EH_SAS_KEY)\n"
