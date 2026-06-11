@@ -92,6 +92,42 @@ keep-alive idle between paced sends), not a guaranteed count of open sockets:
 WinHTTP pools and reuses connections beneath the API. `--connections` raises
 WinHTTP's per-server connection cap so the pool can actually hold ~N at once.
 
+## Validating connection reuse (TIME_WAIT)
+
+The whole point of the tool is that the N connections stay open and get reused,
+not reopened per request. Watch that from a second PowerShell window while a run
+is in flight:
+
+```powershell
+$procId=(Get-Process eh-loadtest).Id; while($true){ "{0}  ESTABLISHED={1}  TIME_WAIT={2}" -f (Get-Date -Format HH:mm:ss),@(Get-NetTCPConnection -OwningProcess $procId -RemotePort 443 -State Established -EA SilentlyContinue).Count,@(Get-NetTCPConnection -RemotePort 443 -State TimeWait -EA SilentlyContinue).Count; Start-Sleep 1 }
+```
+
+`ESTABLISHED` should sit flat at ~`--connections`: those are the live keep-alive
+sockets. `TIME_WAIT` is the meter for churn.
+
+`TIME_WAIT` is a normal TCP state. The side that *closes* a connection keeps the
+local port reserved for ~2 minutes afterwards, so a lost final ACK can still be
+answered and stray packets from the old connection drain out before that port is
+reused. A reused keep-alive connection is never closed, so it never enters
+`TIME_WAIT`. That makes the counter a direct read on connection reuse:
+
+- **Flat, small `TIME_WAIT`** (a steady plateau) = healthy. Connections are
+  long-lived; the trickle is just occasional turnover (the gateway/load balancer
+  aging out idle sockets, or the odd failed request reconnecting). A steady
+  population of `T` implies roughly `T / 120s` closes per second across the whole
+  fleet, i.e. per-connection lifetimes of minutes. Note the plateau builds up
+  over the first ~2 minutes as closures accumulate faster than they expire; a
+  rise to a level that then holds flat is reaching steady state, not worsening.
+- **`TIME_WAIT` climbing with no plateau** = churn. Connections are opened, used
+  once, and closed, each paying a fresh TCP+TLS handshake. Left unchecked this
+  exhausts the ~16K Windows ephemeral ports (49152-65535) and new connects start
+  failing.
+
+To attribute the turnover, read it against the tool's own report line:
+`failed=0` with a flat plateau means the closes are server-side recycling; a
+rising `failed=` / `err{}` count means requests are erroring and reconnecting
+(`fail_request` closes the socket, then the worker backs off and reconnects).
+
 ## Container
 
 A multi-stage **Windows** [`Dockerfile`](Dockerfile) builds the binary (servercore
