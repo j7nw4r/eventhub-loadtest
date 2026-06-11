@@ -29,15 +29,18 @@ jobs:
 
   # Build the Windows container image and prove the binary runs inside it. The
   # in-container VS Build Tools install makes this slow (~20+ min); it is the
-  # authoritative "works in a container" check for the deploy path. The base
-  # image is matched to the hosted runner's Windows build for process isolation.
+  # authoritative "works in a container" check for the deploy path.
+  #
+  # Pinned to windows-2022: it runs the Docker daemon in Windows-container mode.
+  # The newer windows-2025 runner does not start a Windows Docker engine. The
+  # base image (ltsc2022) is matched to the 2022 kernel for process isolation.
   docker:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
       - name: Build image
-        run: docker build --build-arg WINDOWS_VERSION=ltsc2025 -t eh-loadtest:ci .
+        run: docker build --build-arg WINDOWS_VERSION=ltsc2022 -t eh-loadtest:ci .
 
       - name: Smoke test (binary runs in the container)
         run: docker run --rm eh-loadtest:ci --help
