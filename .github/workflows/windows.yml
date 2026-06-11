@@ -14,8 +14,12 @@ jobs:
 
       # windows-latest ships MSVC + the Windows SDK, which provide WinHTTP,
       # bcrypt, and crypt32. No third-party dependencies to install.
+      # Don't pin the VS generator version: the hosted image's VS edition gets
+      # bumped over time (e.g. 2022 -> 2026), so let CMake auto-select whichever
+      # Visual Studio is installed. -A x64 still applies to the default VS
+      # generator the runner provides.
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S . -B build -A x64
 
       - name: Build
         run: cmake --build build --config Release
