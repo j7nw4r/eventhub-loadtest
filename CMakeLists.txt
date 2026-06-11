@@ -19,6 +19,12 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# Statically link the MSVC runtime (/MT) so the binary is self-contained: it can
+# run in a minimal Windows container (servercore/nanoserver) with no VC++
+# redistributable installed. Only OS DLLs (winhttp/bcrypt/crypt32) are needed.
+# CMP0091 (>=3.15, NEW by default here) makes this property authoritative.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 find_package(Threads REQUIRED)
 
 add_executable(eh-loadtest

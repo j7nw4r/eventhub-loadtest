@@ -326,7 +326,7 @@ struct Client::Impl {
         Worker* w = reinterpret_cast<Worker*>(ctx);
         Impl* self = w->impl;
         switch (code) {
-            case WINHTTP_CALLBACK_STATUS_SEND_REQUEST_COMPLETE:
+            case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
                 self->on_send_complete(w);
                 break;
             case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE:
