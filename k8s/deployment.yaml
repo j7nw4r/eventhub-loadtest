@@ -1,0 +1,50 @@
+# Horizontal scale: replicas x --connections = total sustained connections.
+#   20 replicas x 2000 connections = ~40,000 sustained connections.
+#
+# Keep per-pod connections modest (each TLS connection costs ~tens of KB of
+# heap plus an fd) and add replicas to reach the target. Many small pods give a
+# more realistic, distributed client footprint than one giant process and avoid
+# a single pod hitting the kernel's per-process fd ceiling.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eh-loadtest
+  labels: { app: eh-loadtest }
+spec:
+  replicas: 20
+  selector:
+    matchLabels: { app: eh-loadtest }
+  template:
+    metadata:
+      labels: { app: eh-loadtest }
+    spec:
+      containers:
+        - name: eh-loadtest
+          image: youracr.azurecr.io/eh-loadtest:1.0
+          args:
+            - "--host=$(EH_HOST)"
+            - "--target=/myeventhub/messages?api-version=2014-01"
+            - "--connections=2000"
+            - "--interval-ms=1000"
+            - "--ramp-s=60"
+            - "--warmup-s=30"
+            - "--report-interval-s=10"
+          env:
+            - name: EH_HOST
+              value: "myns.servicebus.windows.net"
+            # SAS material from a k8s Secret — never bake tokens into the image.
+            - name: EH_SAS_KEY_NAME
+              valueFrom: { secretKeyRef: { name: eh-sas, key: keyName } }
+            - name: EH_SAS_KEY
+              valueFrom: { secretKeyRef: { name: eh-sas, key: key } }
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits:   { cpu: "1",    memory: "512Mi" }
+      # Raise the file-descriptor ceiling so a pod can hold thousands of sockets.
+      # (Requires a runtime that honors pod-level ulimits, or a node-level
+      # default. On AKS the default hard limit is usually high enough for 2000.)
+---
+# Create the Secret once (do NOT commit real values):
+#   kubectl create secret generic eh-sas \
+#     --from-literal=keyName='RootManageSharedAccessKey' \
+#     --from-literal=key='<base64-sas-key>'
