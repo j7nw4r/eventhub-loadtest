@@ -95,8 +95,10 @@ WinHTTP's per-server connection cap so the pool can actually hold ~N at once.
 ## Validating connection reuse (TIME_WAIT)
 
 The whole point of the tool is that the N connections stay open and get reused,
-not reopened per request. Watch that from a second PowerShell window while a run
-is in flight:
+not reopened per request. There are two checks, in increasing order of rigor; run
+either from a second PowerShell window while a run is in flight.
+
+### Quick check: ESTABLISHED + TIME_WAIT counts
 
 ```powershell
 $procId=(Get-Process eh-loadtest).Id; while($true){ "{0}  ESTABLISHED={1}  TIME_WAIT={2}" -f (Get-Date -Format HH:mm:ss),@(Get-NetTCPConnection -OwningProcess $procId -RemotePort 443 -State Established -EA SilentlyContinue).Count,@(Get-NetTCPConnection -RemotePort 443 -State TimeWait -EA SilentlyContinue).Count; Start-Sleep 1 }
@@ -109,7 +111,7 @@ sockets. `TIME_WAIT` is the meter for churn.
 local port reserved for ~2 minutes afterwards, so a lost final ACK can still be
 answered and stray packets from the old connection drain out before that port is
 reused. A reused keep-alive connection is never closed, so it never enters
-`TIME_WAIT`. That makes the counter a direct read on connection reuse:
+`TIME_WAIT`. That makes the counter a read on connection reuse:
 
 - **Flat, small `TIME_WAIT`** (a steady plateau) = healthy. Connections are
   long-lived; the trickle is just occasional turnover (the gateway/load balancer
@@ -127,6 +129,50 @@ To attribute the turnover, read it against the tool's own report line:
 `failed=0` with a flat plateau means the closes are server-side recycling; a
 rising `failed=` / `err{}` count means requests are erroring and reconnecting
 (`fail_request` closes the socket, then the worker backs off and reconnects).
+
+### Stronger check: do the same sockets persist?
+
+The count alone has a blind spot. `ESTABLISHED` can hold at 100 even under full
+churn (100 sockets closing and 100 opening each second keeps the count pinned).
+And `TIME_WAIT` only accrues on the side that *actively* closes, so churn where
+the **server** closes first (the `TIME_WAIT` lands on the gateway, not you) or
+where connections die by **RST** (no `TIME_WAIT` at all) is invisible to the
+quick check. Since the most likely churn here, the gateway aging out idle
+connections, is server-initiated, close the gap by checking connection
+*identity*: capture the local ephemeral ports each tick and diff them.
+
+```powershell
+$procId = (Get-Process eh-loadtest).Id
+$prev = @{}
+while ($true) {
+  $cur = @{}
+  Get-NetTCPConnection -OwningProcess $procId -RemotePort 443 -State Established -EA SilentlyContinue |
+    ForEach-Object { $cur[$_.LocalPort] = $true }
+  $tw   = @(Get-NetTCPConnection -RemotePort 443 -State TimeWait -EA SilentlyContinue).Count
+  $held = @($cur.Keys | Where-Object { $prev.ContainsKey($_) }).Count
+  $new  = $cur.Count  - $held     # ports that appeared since last tick (creation rate)
+  $gone = $prev.Count - $held     # ports that vanished since last tick (close rate)
+  "{0}  EST={1}  TW={2}  held={3}  new={4}  gone={5}" -f `
+    (Get-Date -Format HH:mm:ss), $cur.Count, $tw, $held, $new, $gone
+  $prev = $cur
+  Start-Sleep 1
+}
+```
+
+`held` is how many of this tick's connections are the *same sockets* as last
+tick. Keep-alive holds the four-tuple, so `held` tracks `EST` every tick; churn
+hands out fresh ephemeral ports, so `held` collapses even while `EST` stays at
+100. `new` / `gone` are the per-second create / close rates (both ~0 in steady
+state). `held` is the signal to trust: it catches the server-initiated and RST
+churn that `TIME_WAIT` misses, and high overlap cannot be faked (`new`/`gone` can
+undercount sub-second churn that the 1s sample skips; `held` cannot). Ignore the
+first line, where `held=0` because `$prev` starts empty.
+
+The same check as a one-liner:
+
+```powershell
+$procId=(Get-Process eh-loadtest).Id; $prev=@{}; while($true){ $cur=@{}; Get-NetTCPConnection -OwningProcess $procId -RemotePort 443 -State Established -EA SilentlyContinue|%{$cur[$_.LocalPort]=$true}; $tw=@(Get-NetTCPConnection -RemotePort 443 -State TimeWait -EA SilentlyContinue).Count; $held=@($cur.Keys|?{$prev.ContainsKey($_)}).Count; "{0}  EST={1}  TW={2}  held={3}  new={4}  gone={5}" -f (Get-Date -Format HH:mm:ss),$cur.Count,$tw,$held,($cur.Count-$held),($prev.Count-$held); $prev=$cur; Start-Sleep 1 }
+```
 
 ## Container
 
