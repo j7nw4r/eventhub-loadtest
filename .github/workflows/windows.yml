@@ -39,6 +39,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Hosted Windows runners no longer start the Windows Docker engine by
+      # default. Start the service and confirm it's in Windows-container mode.
+      - name: Start Docker (Windows engine)
+        run: |
+          Start-Service docker -ErrorAction SilentlyContinue
+          docker version
+          docker info --format 'OSType={{.OSType}}'
+
       - name: Build image
         run: docker build --build-arg WINDOWS_VERSION=ltsc2022 -t eh-loadtest:ci .
 
