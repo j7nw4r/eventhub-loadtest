@@ -4,7 +4,15 @@
 # Many small pods give a more realistic, distributed client footprint than one
 # giant process. This is a WINDOWS container, so it must land on a Windows node
 # pool (nodeSelector below); the image base must match the node's Windows build
-# (see Dockerfile WINDOWS_VERSION).
+# (Dockerfile WINDOWS_VERSION=ltsc2022 <-> node pool os-sku Windows2022).
+#
+# Egress assumption: the cluster routes outbound through a NAT gateway (see
+# scripts/aks-40k-setup.sh and docs/aks-40k.md), not the default load balancer.
+# All 40K sockets hit one destination (the Event Hubs host on :443), so the
+# load balancer's small per-node SNAT budget would exhaust; the NAT gateway's
+# 64,512 ports/IP is what makes 40K-to-one-endpoint hold instead of churning.
+# Keep --interval-ms well below the NAT gateway idle timeout, or idle keep-alive
+# flows get reaped and reconnect (churn).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -21,9 +29,20 @@ spec:
       # Schedule onto Windows nodes; this is a Windows container image.
       nodeSelector:
         kubernetes.io/os: windows
+      # Spread the pods evenly across the Windows nodes so no single node holds a
+      # disproportionate share of the 40K (more realistic, and avoids one node's
+      # local resources, handles/ephemeral ports/CPU, becoming the bottleneck).
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: eh-loadtest }
       containers:
         - name: eh-loadtest
-          image: youracr.azurecr.io/eh-loadtest:1.0
+          # Pushed by CI to your ACR (see .github/workflows/windows.yml). Replace
+          # <acr> with your registry; pin a tag (git sha) rather than :latest.
+          image: <acr>.azurecr.io/eh-loadtest:latest
           args:
             # host, target, and signing URI are all derived from the
             # connection string in EH_CONNECTION_STRING below.
