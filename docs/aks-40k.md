@@ -89,15 +89,32 @@ Set `vars.ACR_NAME`, `secrets.AZURE_CLIENT_ID`, `secrets.AZURE_TENANT_ID`, and
 `secrets.AZURE_SUBSCRIPTION_ID` in the repo first. Then edit
 `k8s/deployment.yaml` to replace `<acr>` and pin the git-sha tag.
 
-## Step 3: secret + deploy
+## Step 3: provide the connection string + deploy
+
+The dedicated test Event Hubs connection string is supplied via the
+`EH_CONNECTION_STRING` env var (the same knob the tool uses locally), so it never
+lands in a manifest or shell history. `scripts/aks-set-secret.sh` turns it into
+the `eh-sas` Secret the Deployment reads. Include `EntityPath=<hub>` so the
+target is set for you.
 
 ```bash
-kubectl create secret generic eh-sas \
-  --from-literal=connectionString='Endpoint=sb://<ns>.servicebus.windows.net/;SharedAccessKeyName=SendPolicy;SharedAccessKey=<key>;EntityPath=<hub>'
+# A) plain env var
+export EH_CONNECTION_STRING='Endpoint=sb://<ns>.servicebus.windows.net/;SharedAccessKeyName=SendPolicy;SharedAccessKey=<key>;EntityPath=<hub>'
+scripts/aks-set-secret.sh
+
+# B) or resolve from 1Password inside the wrapped process only
+export EH_CONNECTION_STRING='op://Private/EventHub Test/connection string'
+op run -- scripts/aks-set-secret.sh
 
 kubectl apply -f k8s/deployment.yaml
 kubectl get pods -l app=eh-loadtest -o wide      # confirm spread across nodes
 ```
+
+The script is idempotent: re-run it to rotate the string, then
+`kubectl rollout restart deploy/eh-loadtest` so running pods pick up the new
+value. (For a longer-lived setup, the connection string can instead come from
+Azure Key Vault via the Secrets Store CSI driver; the env-var path above is the
+lightweight option for a test run.)
 
 ## Step 4: validate the run
 

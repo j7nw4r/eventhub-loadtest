@@ -60,6 +60,8 @@ spec:
             requests: { cpu: "250m", memory: "256Mi" }
             limits:   { cpu: "1",    memory: "512Mi" }
 ---
-# Create the Secret once (do NOT commit real values):
-#   kubectl create secret generic eh-sas \
-#     --from-literal=connectionString='Endpoint=sb://myns.servicebus.windows.net/;SharedAccessKeyName=SendPolicy;SharedAccessKey=<base64-key>;EntityPath=myeventhub'
+# Provide the connection string before applying (do NOT commit real values).
+# Supply it via the EH_CONNECTION_STRING env var and create the eh-sas Secret
+# with the helper (also supports an op:// 1Password reference under `op run`):
+#   export EH_CONNECTION_STRING='Endpoint=sb://<ns>.servicebus.windows.net/;SharedAccessKeyName=SendPolicy;SharedAccessKey=<key>;EntityPath=<hub>'
+#   scripts/aks-set-secret.sh

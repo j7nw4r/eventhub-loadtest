@@ -119,10 +119,13 @@ Done. Cluster is up. Next:
        $ACR.azurecr.io/eh-loadtest:<tag>
      Set that image in k8s/deployment.yaml (or via kustomize/sed).
 
-  2. Create the connection-string Secret for the dedicated test Event Hubs
-     (do NOT commit the value):
-       kubectl create secret generic eh-sas \\
-         --from-literal=connectionString='Endpoint=sb://<ns>.servicebus.windows.net/;SharedAccessKeyName=SendPolicy;SharedAccessKey=<key>;EntityPath=<hub>'
+  2. Provide the dedicated test Event Hubs connection string (never committed;
+     supplied via the EH_CONNECTION_STRING env var, same as the tool locally):
+       export EH_CONNECTION_STRING='Endpoint=sb://<ns>.servicebus.windows.net/;SharedAccessKeyName=SendPolicy;SharedAccessKey=<key>;EntityPath=<hub>'
+       scripts/aks-set-secret.sh
+     Or resolve it from 1Password without it touching your shell history:
+       export EH_CONNECTION_STRING='op://Private/EventHub Test/connection string'
+       op run -- scripts/aks-set-secret.sh
 
   3. Deploy and watch it ramp:
        kubectl apply -f k8s/deployment.yaml
