@@ -36,6 +36,10 @@ jobs:
   # base image (ltsc2022) is matched to the 2022 kernel for process isolation.
   docker:
     runs-on: windows-2022
+    # id-token: write is needed for OIDC login to Azure (azure/login below).
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -52,3 +56,34 @@ jobs:
 
       - name: Smoke test (binary runs in the container)
         run: docker run --rm eh-loadtest:ci --help
+
+      # Push to ACR only on main / tags, never on PRs. Requires (Settings ->
+      # Secrets and variables -> Actions):
+      #   vars.ACR_NAME              your registry name, e.g. ehloadtest1234
+      #   secrets.AZURE_CLIENT_ID    OIDC app registration with AcrPush on the ACR
+      #   secrets.AZURE_TENANT_ID
+      #   secrets.AZURE_SUBSCRIPTION_ID
+      # Set up the federated credential per:
+      #   https://learn.microsoft.com/azure/developer/github/connect-from-azure-openid-connect
+      - name: Azure login (OIDC)
+        if: github.event_name != 'pull_request'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Push image to ACR
+        if: github.event_name != 'pull_request'
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: |
+          az acr login --name $env:ACR_NAME
+          $registry = "$($env:ACR_NAME).azurecr.io"
+          $sha = "$registry/eh-loadtest:$($env:GITHUB_SHA.Substring(0,12))"
+          $latest = "$registry/eh-loadtest:latest"
+          docker tag eh-loadtest:ci $sha
+          docker tag eh-loadtest:ci $latest
+          docker push $sha
+          docker push $latest
+          Write-Host "Pushed $sha and $latest"

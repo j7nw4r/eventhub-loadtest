@@ -194,6 +194,15 @@ per-process handle pressure): `replicas × --connections = total`, e.g.
 Windows container onto a Windows node pool (`nodeSelector: kubernetes.io/os:
 windows`), connection string from a k8s Secret.
 
+On AKS the binding constraint is not the replica count but **outbound SNAT**:
+all 40K sockets target one destination (the Event Hubs host on `:443`), and the
+default load balancer's per-node SNAT budget exhausts long before 40K. Route
+egress through a **NAT gateway** (64,512 ports per IP) and disable Windows
+OutboundNAT. [`scripts/aks-40k-setup.sh`](scripts/aks-40k-setup.sh) provisions a
+greenfield cluster wired this way; [`docs/aks-40k.md`](docs/aks-40k.md) is the
+full runbook (sizing, validation via NAT gateway metrics, Event Hubs TU limits,
+teardown).
+
 ## Configuration
 
 Every knob is a CLI flag; the ones carrying secrets or per-environment values
